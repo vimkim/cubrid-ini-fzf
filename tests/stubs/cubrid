@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+
+set -o nounset
+
+log_call ()
+{
+  local argument
+
+  printf 'cubrid' >> "$STUB_LOG"
+  for argument in "$@"; do
+    printf ' <%s>' "$argument" >> "$STUB_LOG"
+  done
+  printf '\n' >> "$STUB_LOG"
+}
+
+log_call "$@"
+
+if [[ ${1-} == server && ${2-} == status ]]; then
+  if [[ ${CUBRID_STATUS_FAIL:-0} == 1 ]]; then
+    printf 'simulated server status failure\n' >&2
+    exit 9
+  fi
+
+  printf '@ cubrid server status\n'
+  for running_database in ${STUB_RUNNING_DATABASES:-}; do
+    printf 'Server %s (rel 11.4, pid 1234)\n' "$running_database"
+  done
+  exit 0
+fi
+
+if [[ ${1-} == paramdump ]]; then
+  if [[ ${PARAMDUMP_FAIL:-0} == 1 ]]; then
+    printf 'simulated paramdump failure\n' >&2
+    exit 8
+  fi
+
+  if [[ -n ${PARAMDUMP_FIXTURE:-} ]]; then
+    /bin/cat -- "$PARAMDUMP_FIXTURE"
+  else
+    printf '%s\n' \
+      'System parameters to be used by the client program.' \
+      '[C ] max_clients=100 (100)' \
+      '[C*] complex_value="a=b (c)" ("")' \
+      '[C ] client_only="hello world" ("")' \
+      "System parameters loaded by the server 'testdb'" \
+      '[S ] max_clients=200 (100)' \
+      '[S*] server_only=-1 (-1)'
+  fi
+  exit 0
+fi
+
+printf 'unexpected cubrid stub arguments\n' >&2
+exit 7

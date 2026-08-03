@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+
+set -o nounset
+
+log_call ()
+{
+  local argument
+
+  printf 'fzf' >> "$STUB_LOG"
+  for argument in "$@"; do
+    printf ' <%s>' "$argument" >> "$STUB_LOG"
+  done
+  printf '\n' >> "$STUB_LOG"
+}
+
+log_call "$@"
+
+input=$(/bin/cat)
+printf '%s\n' "$input" > "$FZF_CAPTURE"
+
+if [[ -n ${FZF_EXIT:-} ]]; then
+  exit "$FZF_EXIT"
+fi
+
+if [[ -n ${FZF_SELECT_NAME:-} ]]; then
+  /usr/bin/awk -F '\t' -v name="$FZF_SELECT_NAME" '$2 == name { print; exit }' \
+    <<< "$input"
+else
+  /usr/bin/awk 'NR == 1 { print; exit }' <<< "$input"
+fi

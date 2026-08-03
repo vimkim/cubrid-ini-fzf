@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+readonly PROGRAM_NAME=${0##*/}
+
+database=testdb
+section=common
+config_file=
+database_registry=
+database_is_running=false
+paramdump_output=
+parameter_rows=
+selected_parameter=
+selected_scope=
+selected_observed_value=
+new_value=
+backup_file=
+change_started=false
+
+usage ()
+{
+  cat <<EOF
+Usage: $PROGRAM_NAME [OPTIONS]
+
+Interactively update one CUBRID system parameter in cubrid.conf.
+
+Options:
+  -d, --database DATABASE  Database used for status and paramdump (default: testdb)
+  -s, --section SECTION    ini.sh section: common, standalone, or @DATABASE
+                           (default: common)
+  -h, --help               Show this help and exit
+
+Examples:
+  $PROGRAM_NAME
+  $PROGRAM_NAME --database demodb
+  $PROGRAM_NAME -d demodb --section @demodb
+EOF
+}
+
+die ()
+{
+  printf '%s: error: %s\n' "$PROGRAM_NAME" "$*" >&2
+  exit 1
+}
+
+cancel ()
+{
+  if [[ $change_started == true ]]; then
+    printf '\n%s: interrupted after the write phase began; inspect cubrid.conf' \
+      "$PROGRAM_NAME" >&2
+    if [[ -n $backup_file ]]; then
+      printf ' and backup %s' "$backup_file" >&2
+    fi
+    printf '.\n' >&2
+  else
+    printf '\n%s: cancelled; cubrid.conf was not changed.\n' "$PROGRAM_NAME" >&2
+  fi
+  exit 130
+}
+
+trap cancel INT
+
+require_option_value ()
+{
+  local option=$1
+  local value=${2-}
+
+  if [[ -z $value || $value == -* ]]; then
+    die "$option requires a value"
+  fi
+}
+
+parse_arguments ()
+{
+  while (( $# > 0 )); do
+    case $1 in
+      -d|--database)
+        require_option_value "$1" "${2-}"
+        database=$2
+        shift 2
+        ;;
+      --database=*)
+        database=${1#*=}
+        [[ -n $database ]] || die "--database requires a value"
+        shift
+        ;;
+      -s|--section)
+        require_option_value "$1" "${2-}"
+        section=$2
+        shift 2
+        ;;
+      --section=*)
+        section=${1#*=}
+        [[ -n $section ]] || die "--section requires a value"
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --)
+        shift
+        (( $# == 0 )) || die "unexpected argument: $1"
+        ;;
+      -* )
+        die "unknown option: $1"
+        ;;
+      *)
+        die "unexpected argument: $1"
+        ;;
+    esac
+  done
+
+  [[ $database =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] \
+    || die "invalid database name: $database"
+
+  if [[ $section != common && $section != standalone \
+        && ! $section =~ ^@[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+    die "invalid section '$section' (use common, standalone, or @DATABASE)"
+  fi
+}
+
+check_dependencies ()
+{
+  # ini.sh is intentionally checked first: no interactive work is useful
+  # unless the required writer is available.
+  command -v ini.sh >/dev/null 2>&1 \
+    || die "ini.sh is required but was not found on PATH"
+  command -v cubrid >/dev/null 2>&1 \
+    || die "cubrid is required but was not found on PATH"
+  command -v fzf >/dev/null 2>&1 \
+    || die "fzf is required but was not found on PATH"
+}
+
+validate_environment ()
+{
+  [[ -n ${CUBRID:-} ]] || die 'CUBRID is not set'
+  [[ -n ${CUBRID_DATABASES:-} ]] || die 'CUBRID_DATABASES is not set'
+
+  config_file=$CUBRID/conf/cubrid.conf
+  database_registry=$CUBRID_DATABASES/databases.txt
+
+  [[ -f $config_file ]] || die "configuration file not found: $config_file"
+  [[ -r $config_file ]] || die "configuration file is not readable: $config_file"
+  [[ -w $config_file ]] || die "configuration file is not writable: $config_file"
+  [[ -f $database_registry ]] || die "database registry not found: $database_registry"
+  [[ -r $database_registry ]] || die "database registry is not readable: $database_registry"
+}
+
+validate_database_registration ()
+{
+  local registered_database
+
+  while read -r registered_database _ || [[ -n $registered_database ]]; do
+    [[ -n $registered_database ]] || continue
+    [[ $registered_database == \#* ]] && continue
+    if [[ $registered_database == "$database" ]]; then
+      return 0
+    fi
+  done < "$database_registry"
+
+  die "database '$database' is not registered in $database_registry"
+}
+
+detect_database_status ()
+{
+  local status_output
+  local status_line
+
+  if ! status_output=$(cubrid server status 2>&1); then
+    printf '%s\n' "$status_output" >&2
+    die "could not determine database server status"
+  fi
+
+  database_is_running=false
+  while IFS= read -r status_line; do
+    if [[ $status_line =~ ^Server[[:space:]]+([^[:space:]]+)[[:space:]]+\( \
+          && ${BASH_REMATCH[1]} == "$database" ]]; then
+      database_is_running=true
+      return 0
+    fi
+  done <<< "$status_output"
+}
+
+run_paramdump ()
+{
+  local -a command=(cubrid paramdump)
+
+  if [[ $database_is_running == false ]]; then
+    command+=(-S)
+  fi
+  command+=("$database")
+
+  if ! paramdump_output=$("${command[@]}" 2>&1); then
+    printf '%s\n' "$paramdump_output" >&2
+    die "paramdump failed for database '$database'"
+  fi
+}
+
+parse_parameters ()
+{
+  parameter_rows=$(awk '
+    function remember(name) {
+      if (!(name in seen)) {
+        seen[name] = 1
+        order[++count] = name
+      }
+    }
+
+    /^\[[CS][ *]\][[:space:]]+[A-Za-z_][A-Za-z0-9_]*=/ {
+      scope = substr($0, 2, 1)
+      record = substr($0, 5)
+      sub(/^[[:space:]]+/, "", record)
+      equals = index(record, "=")
+      if (equals == 0) {
+        next
+      }
+
+      name = substr(record, 1, equals - 1)
+      value = substr(record, equals + 1)
+      if (name !~ /^[A-Za-z_][A-Za-z0-9_]*$/) {
+        next
+      }
+
+      gsub(/\t/, " ", value)
+      remember(name)
+      if (scope == "C") {
+        client[name] = value
+        has_client[name] = 1
+      } else {
+        server[name] = value
+        has_server[name] = 1
+      }
+    }
+
+    END {
+      for (i = 1; i <= count; i++) {
+        name = order[i]
+        if (has_client[name] && has_server[name]) {
+          scope = "C/S"
+          if (client[name] == server[name]) {
+            display = server[name]
+          } else {
+            display = "C: " client[name] " | S: " server[name]
+          }
+        } else if (has_server[name]) {
+          scope = "S"
+          display = server[name]
+        } else {
+          scope = "C"
+          display = client[name]
+        }
+        print scope "\t" name "\t" display
+      }
+    }
+  ' <<< "$paramdump_output")
+
+  [[ -n $parameter_rows ]] \
+    || die "paramdump returned no recognizable system parameters"
+}
+
+choose_parameter ()
+{
+  local selected_row
+  local fzf_status
+
+  set +o errexit
+  selected_row=$(printf '%s\n' "$parameter_rows" \
+    | fzf --delimiter=$'\t' \
+          --with-nth=1,2,3 \
+          --nth=1,2,3 \
+          --prompt="cubrid.conf ($database/$section)> " \
+          --header='SCOPE  PARAMETER  EFFECTIVE VALUE (DEFAULT)')
+  fzf_status=$?
+  set -o errexit
+
+  if (( fzf_status != 0 )) || [[ -z $selected_row ]]; then
+    cancel
+  fi
+
+  IFS=$'\t' read -r selected_scope selected_parameter selected_observed_value \
+    <<< "$selected_row"
+
+  [[ $selected_parameter =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+    || die "fzf returned an invalid parameter record"
+}
+
+prompt_for_value ()
+{
+  printf 'Selected: [%s] %s\n' "$selected_scope" "$selected_parameter"
+  printf 'Observed: %s\n' "$selected_observed_value"
+  printf 'New value (empty input cancels; use "" for an empty CUBRID string): '
+
+  if ! IFS= read -r new_value; then
+    cancel
+  fi
+
+  if [[ -z $new_value ]]; then
+    printf '%s: cancelled; cubrid.conf was not changed.\n' "$PROGRAM_NAME" >&2
+    exit 0
+  fi
+}
+
+confirm_change ()
+{
+  local answer
+
+  printf '\nChange summary:\n'
+  printf '  Database: %s\n' "$database"
+  printf '  File:     %s\n' "$config_file"
+  printf '  Section:  [%s]\n' "$section"
+  printf '  Parameter: %s\n' "$selected_parameter"
+  printf '  New value: %s\n' "$new_value"
+
+  if [[ $database_is_running == true ]]; then
+    printf '\nDatabase %s is running. The active process will keep its old value.\n' \
+      "$database" >&2
+    printf 'You must stop/start the affected database after this edit.\n' >&2
+    printf 'Write the change and restart the affected processes afterward? [y/N] '
+  else
+    printf 'Write this change? [y/N] '
+  fi
+
+  if ! IFS= read -r answer; then
+    cancel
+  fi
+
+  case $answer in
+    y|Y|yes|YES|Yes)
+      ;;
+    *)
+      printf '%s: cancelled; cubrid.conf was not changed.\n' "$PROGRAM_NAME" >&2
+      exit 0
+      ;;
+  esac
+}
+
+backup_and_update ()
+{
+  local timestamp
+
+  change_started=true
+  timestamp=$(date +%Y%m%d-%H%M%S)
+  backup_file=$config_file.bak.$timestamp.$$
+
+  cp -p -- "$config_file" "$backup_file" \
+    || die "could not create backup: $backup_file"
+
+  if ! ini.sh -s "$section" "$config_file" "$selected_parameter" -- "$new_value"; then
+    printf '%s: backup retained at %s\n' "$PROGRAM_NAME" "$backup_file" >&2
+    die "ini.sh failed while updating '$selected_parameter'"
+  fi
+}
+
+verify_update ()
+{
+  local stored_value
+
+  if ! stored_value=$(ini.sh -s "$section" "$config_file" "$selected_parameter"); then
+    printf '%s: backup retained at %s\n' "$PROGRAM_NAME" "$backup_file" >&2
+    die "could not read '$selected_parameter' back with ini.sh"
+  fi
+
+  if [[ $stored_value != "$new_value" ]]; then
+    printf '%s: requested value: %s\n' "$PROGRAM_NAME" "$new_value" >&2
+    printf '%s: stored value:    %s\n' "$PROGRAM_NAME" "$stored_value" >&2
+    printf '%s: backup retained at %s\n' "$PROGRAM_NAME" "$backup_file" >&2
+    die "read-back verification failed for '$selected_parameter'"
+  fi
+}
+
+print_success ()
+{
+  printf '\nUpdated %s in [%s].\n' "$selected_parameter" "$section"
+  printf 'Configuration: %s\n' "$config_file"
+  printf 'Backup:        %s\n' "$backup_file"
+  printf '\nApply the persistent setting by restarting the database:\n'
+  printf '  cubrid server stop %s\n' "$database"
+  printf '  cubrid server start %s\n' "$database"
+  printf 'Client-side parameters may also require a broker restart.\n'
+}
+
+main ()
+{
+  parse_arguments "$@"
+  check_dependencies
+  validate_environment
+  validate_database_registration
+  detect_database_status
+  run_paramdump
+  parse_parameters
+  choose_parameter
+  prompt_for_value
+  confirm_change
+  backup_and_update
+  verify_update
+  print_success
+}
+
+main "$@"
