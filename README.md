@@ -43,6 +43,16 @@ Ensure the selected directory is on `PATH`. A symlink is convenient during
 development because changes in this checkout are available immediately. Keep
 the checkout at a stable path; moving or deleting it breaks the command.
 
+Remove the symlink with:
+
+```bash
+just uninstall
+```
+
+Use the same `CUBRID_INI_FZF_BIN_DIR` override when uninstalling from a custom
+destination. The recipe removes only a symlink pointing to this checkout and
+refuses to touch unrelated paths.
+
 For a versioned or self-contained installation, copy the executable instead:
 
 ```bash
