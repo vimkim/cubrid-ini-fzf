@@ -151,3 +151,6 @@ For additional static checks, run:
 ```bash
 shellcheck cubrid-ini-fzf tests/test-cubrid-ini-fzf.sh tests/stubs/*
 ```
+
+When `CUBRID_CONF_FILE` is selected (for example by `cub-workenv`), edits and
+backups use that file. Otherwise the default remains `$CUBRID/conf/cubrid.conf`.

@@ -103,6 +103,7 @@ setup_case ()
   export STUB_STATE=$case_dir/state
   export FZF_CAPTURE=$case_dir/fzf-input
   export FZF_SELECT_NAME=max_clients
+  unset CUBRID_CONF_FILE
   unset CUBRID_STATUS_FAIL STUB_RUNNING_DATABASES PARAMDUMP_FAIL
   unset PARAMDUMP_FIXTURE FZF_EXIT INI_FAIL_WRITE INI_FAIL_READ INI_READ_MISMATCH
 }
@@ -441,7 +442,20 @@ test_ini_failures_retain_backup ()
   assert_contains "$output_file" 'backup retained at'
 }
 
-printf '1..16\n'
+test_selected_workenv_config_preserves_install_config ()
+{
+  setup_case
+  export CUBRID_CONF_FILE=$case_dir/selected.conf
+  printf '[common]\nmax_clients=100\n' > "$CUBRID_CONF_FILE"
+  run_tool $'250\ny\n'
+  assert_status 0 || return
+  assert_contains "$CUBRID_CONF_FILE" 'max_clients=250' || return
+  assert_contains "$CUBRID/conf/cubrid.conf" 'max_clients=100' || return
+  assert_not_contains "$CUBRID/conf/cubrid.conf" 'max_clients=250'
+}
+
+printf '1..17\n'
+run_test 'selected workenv config preserves installed config' test_selected_workenv_config_preserves_install_config
 run_test 'help works without runtime dependencies' test_help_without_dependencies
 run_test 'ini.sh is checked before other dependencies run' test_ini_is_checked_first
 run_test 'other missing dependencies and environment fail clearly' test_other_dependencies_and_environment

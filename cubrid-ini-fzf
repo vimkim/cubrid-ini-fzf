@@ -140,7 +140,7 @@ validate_environment ()
   [[ -n ${CUBRID:-} ]] || die 'CUBRID is not set'
   [[ -n ${CUBRID_DATABASES:-} ]] || die 'CUBRID_DATABASES is not set'
 
-  config_file=$CUBRID/conf/cubrid.conf
+  config_file=${CUBRID_CONF_FILE:-$CUBRID/conf/cubrid.conf}
   database_registry=$CUBRID_DATABASES/databases.txt
 
   [[ -f $config_file ]] || die "configuration file not found: $config_file"
