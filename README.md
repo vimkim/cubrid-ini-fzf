@@ -1,5 +1,11 @@
 # cubrid-ini-fzf
 
+**Deprecated as of 2026-10-22.** Use
+[cubrid-conf-tui](https://github.com/vimkim/cubrid-conf-tui) instead.
+
+The replacement currently edits `[common]` only. Support for `[standalone]` and
+`[@DATABASE]` is tracked in its [README TODO](https://github.com/vimkim/cubrid-conf-tui#todo).
+
 `cubrid-ini-fzf` is an interactive Bash tool for finding a CUBRID system
 parameter and persisting a new value in `cubrid.conf`.
 
